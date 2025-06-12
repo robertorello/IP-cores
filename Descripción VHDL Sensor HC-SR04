@@ -1,0 +1,260 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.std_logic_unsigned.all;
+entity HC_SR04_FINAL is
+port (
+clk : in std_logic;
+inicio : in std_logic;
+
+ -- I/O HCSRO4
+ trig : out std_logic;
+ echo : in std_logic;
+
+
+-- I/O VISUALIZACIÓN
+segmentos : out std_logic_vector (6 downto 0);
+enable_seg : out std_logic_vector (3 downto 0)
+);
+end HC_SR04_FINAL;
+
+architecture Behavioral of HC_SR04_FINAL is
+
+-- SIGNALS PROCESS COMUNICACIÓN HC-SR04
+-----------------------------------------------------------------------
+
+type estado_nombre_hc is (
+INICIO_HC,
+TRIGGER_HC,
+ESPERA_1_HC,
+RETARDO_ECHO_HC,
+MIDE_HC,
+ESPERA_2_HC
+);
+
+signal estado_hc : estado_nombre_hc;
+signal dist : integer range 0 to 400;
+signal dist_temp : integer range 0 to 400;
+signal cont_hc : integer range 0 to 10000000;
+signal cont_echo : integer range 0 to 100000;
+signal cont_aux_hc : integer range 0 to 100000;
+signal cont_freq : integer range 0 to 100;
+signal temp : integer range 0 to 50000000;
+signal dist_mil : std_logic_vector(3 downto 0);
+signal dist_cen : std_logic_vector(3 downto 0);
+signal dist_dec : std_logic_vector(3 downto 0);
+signal dist_uni : std_logic_vector(3 downto 0);
+
+-- SIGNALS DE VISUALIZACIÓN 7SEGMENTOS
+------------------------------------------------------------------------
+signal enable_aux : std_logic_vector (3 downto 0);
+signal cont_base_enable : integer range 0 to 10000000;
+signal sal_mux : std_logic_vector (3 downto 0);
+signal inicio_filtrado : std_logic;
+signal selector_filtrado : std_logic;
+signal selector_filtrado_ant : std_logic;
+
+-- CONSTANTES (FILTRADO Y CARACTERES 7SEG)
+--------------------------------------------------------------------------------
+constant tiempo_filtro : integer := 1000;
+
+-- DECLARACION FUNCION FILTRO_DIGITAL
+---------------------------------------------------------------------------------
+component filtro_digital is
+port(
+clk : in std_logic;
+inicio : in std_logic;
+entrada : in std_logic;
+salida_filtrada : out std_logic;
+tope_filtro : integer range 0 to 1000000000
+);
+end component;
+begin
+filtro_digital_inicio : filtro_digital
+port map(
+clk => clk,
+inicio => inicio,
+entrada => inicio,
+salida_filtrada => inicio_filtrado,
+tope_filtro => tiempo_filtro
+);
+
+-- PROCESS COMUNICACIÓN SENSOR HC-SR04
+----------------------------------------------------------------------------
+process(inicio, clk)
+begin
+if inicio = '1' then
+estado_hc <= INICIO_HC; -- Estado START_HC
+cont_hc <= 0;
+trig <= '0';
+cont_echo <= 0;
+dist <= 0;
+cont_aux_hc <= 0;
+elsif rising_edge(clk) then
+if cont_freq = 0 then -- Cuando desborda el contador de frecuencia
+case estado_hc is -- Máquina de estados HC-SR04
+when INICIO_HC =>
+cont_hc <= 0; -- Reseteo de cont_hc
+trig <= '0'; -- Poner a baja trig
+cont_echo <= 0; -- Reseteo de cont_echo
+cont_aux_hc <= 0; -- Reseteo de cont_aux_hc
+dist_temp <= cont_echo / 56; -- Cálculo de la distancia
+if dist_temp < 4 or dist_temp = 0 then
+dist <= 0;
+else
+dist <= dist_temp;
+end if;
+estado_hc <= TRIGGER_HC;
+
+when TRIGGER_HC =>
+trig <= '1'; -- Se pone a alta el trig
+cont_hc <= cont_hc + 1; -- Se empieza a contar la duracion el trig
+if cont_hc < (10 - 1) then -- Se cuenta hasta 10
+estado_hc <= TRIGGER_HC;
+else
+estado_hc <= ESPERA_1_HC; -- Estado ESPERAR_1_HC
+end if;
+
+23 when ESPERA_1_HC =>
+24 trig <= '0'; -- Se pone a baja el trig
+25 cont_hc <= cont_hc + 1; -- Se empieza a contar hasta 210
+26 if cont_hc < (210 - 1) then
+27 estado_hc <= ESPERA_1_HC;
+else
+estado_hc <= RETARDO_ECHO_HC;
+end if;
+
+when RETARDO_ECHO_HC =>
+trig <= '0';
+cont_hc <= cont_hc + 1;
+if echo = '1' then
+cont_echo <= cont_echo + 1;
+estado_hc <= MIDE_HC;
+end if;
+
+when MIDE_HC =>
+trig <= '0';
+cont_hc <= cont_hc + 1;
+cont_aux_hc <= cont_hc;
+if echo = '1' and cont_hc < 20209 then
+cont_echo <= cont_echo + 1;
+estado_hc <= MIDE_HC;
+elsif echo = '0' or cont_hc >= 20209 then --echo = '0' or
+estado_hc <= ESPERA_2_HC;
+end if;
+
+when ESPERA_2_HC =>
+trig <= '0';
+cont_hc <= cont_hc + 1;
+if cont_hc < cont_aux_hc + 60000 -1 then --cont_aux_hc
+estado_hc <= ESPERA_2_HC;
+else
+estado_hc <= INICIO_HC;
+end if;
+
+when others =>
+estado_hc <= INICIO_HC;
+cont_hc <= 0;
+trig <= '0';
+cont_echo <= 0;
+dist <= 0;
+cont_aux_hc <= 0;
+
+end case;
+end if;
+end if;
+end process;
+
+process(clk, inicio)
+begin
+if inicio = '1' then
+temp <= 0;
+elsif rising_edge(clk) then
+if temp = 25000000 - 1 then
+temp <= 0;
+else
+temp <= temp + 1;
+end if;
+end if;
+end process;
+
+process(clk, inicio)
+begin
+if inicio = '1' then
+cont_freq <= 0;
+elsif rising_edge(clk) then
+if cont_freq = 100-1 then
+cont_freq <= 0;
+else
+cont_freq <= cont_freq + 1;
+end if;
+end if;
+end process;
+
+-- Conversión del valor de dist a BCDs individuales
+dist_mil <= std_logic_vector(to_unsigned((dist / 1000) mod 10, 4));
+dist_cen <= std_logic_vector(to_unsigned((dist / 100) mod 10, 4));
+dist_dec <= std_logic_vector(to_unsigned((dist / 10) mod 10, 4));
+dist_uni <= std_logic_vector(to_unsigned(dist mod 10, 4));
+
+-- PROCESS DE CONFIGURACION DE 7SEGMENTOS (cont_base_enable, sal_mux, segmentos, etc...)
+--------------------------------------------------------------------------------
+-------------
+process(inicio, clk) -- Configuración del cont_base_enable
+begin
+if inicio = '1' then
+cont_base_enable <= 0;
+elsif rising_edge(clk) then
+if cont_base_enable = 100000 then
+cont_base_enable <= 0;
+else
+cont_base_enable <= cont_base_enable+1;
+end if;
+end if;
+end process;
+
+process(clk,inicio) -- PROCESS CONTADOR BASE ENABLE
+begin
+if inicio = '1' then
+enable_aux <= "1101";
+elsif rising_edge(clk) then
+if cont_base_enable = 100000 then
+enable_aux <= enable_aux(2 downto 0) & enable_aux(3);
+end if;
+end if;
+end process;
+--fin de la activación de los siete seg
+enable_seg <= enable_aux;
+-- PROCESS MULTIPLEXADO DE ENTRADAS 7-SEGMENTOS
+
+--------------------------------------------------------------------------------
+process(enable_aux, dist_mil, dist_cen, dist_dec, dist_uni)
+begin
+case enable_aux is
+when "0111" => sal_mux <= dist_mil;
+when "1011" => sal_mux <= dist_cen;
+when "1101" => sal_mux <= dist_dec;
+when "1110" => sal_mux <= dist_uni;
+when others => sal_mux <= "1111";
+end case;
+end process;
+
+-- PROCESS DECODIFICADOR 7-SEGMENTOS
+--------------------------------------------------------------------------
+process(sal_mux)
+begin
+case sal_mux is
+when "0000" => segmentos <= "0000001";
+when "0001" => segmentos <= "1001111";
+when "0010" => segmentos <= "0010010";
+when "0011" => segmentos <= "0000110";
+when "0100" => segmentos <= "1001100";
+when "0101" => segmentos <= "0100100";
+when "0110" => segmentos <= "1100000";
+when "0111" => segmentos <= "0001111";
+when "1000" => segmentos <= "0000000";
+when "1001" => segmentos <= "0001100";
+when others => segmentos <= "1111111";
+end case;
+end process;
+end Behavioral;
