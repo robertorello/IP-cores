@@ -1,0 +1,102 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.std_logic_unsigned.all;
+
+entity UART_RX_V1 is
+  port (
+    clk      : in std_logic;
+    inicio   : in std_logic;
+    leds     : out std_logic_vector(7 downto 0); --leds
+    serialRX : in std_logic
+  );
+end UART_RX_V1;
+
+architecture Behavioral of UART_RX_V1 is
+  constant NUM_BITS  : integer := 8;
+  constant NUM_START : integer := 1;
+  constant NUM_STOP  : integer := 1;
+  constant FREQ_CLK  : integer := 100000000;
+  constant BPS       : integer := 9600; --19200, 38400, 57600 y 115200
+
+  type ESTADO is (
+    REPOSO,
+    START,
+    RX,
+    STOP
+  );
+
+  signal estado_rx    : ESTADO;
+  signal cont_uart_rx : integer range 0 to 2000000;
+  signal cont_bit_rx  : integer range 0 to NUM_BITS;
+  signal entrada_rx   : std_logic;
+  signal salida_rx    : std_logic_vector (7 downto 0);
+  signal salida_uart  : std_logic_vector (7 downto 0);
+  signal pulsos_bps   : integer range 0 to 11000;
+
+begin
+
+  pulsos_bps <= FREQ_CLK/BPS;
+  entrada_rx <= serialRX;
+  leds <= salida_uart;
+
+  process(clk, inicio)
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        salida_rx <="00000000";
+        cont_uart_rx <= 0;
+        cont_bit_rx <= 0;
+        salida_uart <= "00000000";
+        estado_rx <= REPOSO;
+      else
+        case estado_rx is
+          when REPOSO =>
+            if entrada_rx = '0' then
+              cont_uart_rx <= 0;
+              cont_bit_rx <= 0;
+              estado_rx <= START;
+            end if;
+          when START =>
+            if cont_uart_rx = (pulsos_bps * num_start + (pulsos_bps / 2) - 1) then
+              cont_uart_rx <= 0;
+              cont_bit_rx <= 1;
+              salida_rx <= entrada_rx & salida_rx(7 downto 1);
+              estado_rx <= RX;
+            else
+              cont_uart_rx <= cont_uart_rx + 1;
+            end if;
+          when RX =>
+            if cont_uart_rx = (pulsos_bps - 1) then
+              if cont_bit_rx = NUM_BITS - 1 then
+                cont_uart_rx <= 0;
+                cont_bit_rx <= 0;
+                salida_rx <= entrada_rx & salida_rx(7 downto 1);
+                estado_rx <= STOP;
+              else
+                cont_uart_rx <= 0;
+                salida_rx <= entrada_rx & salida_rx(7 downto 1);
+                cont_bit_rx <= cont_bit_rx + 1;
+              end if;
+            else
+              cont_uart_rx <= cont_uart_rx + 1;
+            end if;
+          when STOP =>
+            if cont_uart_rx = (pulsos_bps * num_stop + pulsos_bps / 2 - 1) then
+              estado_rx <= REPOSO;
+              salida_uart <= salida_rx;
+            else
+              cont_uart_rx <= cont_uart_rx + 1;
+            end if;
+          when others =>
+            cont_uart_rx <= 0;
+            estado_rx <= REPOSO;
+            cont_bit_rx <= 0;
+            salida_rx <= "00000000";
+            salida_uart <= "00000000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+end Behavioral;
