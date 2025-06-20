@@ -1,0 +1,598 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.std_logic_unsigned.all;
+
+entity DHT11_FINAL is
+  port (
+    clk            : in std_logic;
+    inicio         : in std_logic;
+    selector       : in std_logic; -- Botón
+    data_bus_dht11 : inout std_logic;
+    segmentos      : out std_logic_vector (6 downto 0);
+    enable_seg     : out std_logic_vector (3 downto 0)
+  );
+end DHT11_FINAL;
+
+architecture Behavioral of DHT11_FINAL is
+
+  -- SIGNALS PROCESS COMUNICACIÓN DHT11
+  ------------------------------------------------------------------------
+  type nombre_estado is (
+    REPOSO,
+    INICIO_1_8_MS,
+    PRESENCIA_DHT,
+    IN_COM_BAJO_80US,
+    IN_COM_ALTO_80US,
+    PULS_BAJO_VAR_50US,
+    PULS_ALTO_VAR,
+    ALMAC_ALTO_DHT11,
+    ALMAC_BAJO_DHT11,
+    CONTROL_CONT_BITS,
+    GENERAR_CHECKSUM,
+    CONTROL_CHECKSUM,
+    FINAL_LECTURA,
+    ESTADO_ERROR_CHECKSUM,
+    ESTADO_ERROR_TIMMING
+  );
+
+  signal estado_dht11      : nombre_estado := REPOSO;
+  signal cont_bits_dht11   : integer range 0 to 40;
+  signal h                 : integer range 0 to 200_000_000;
+  signal datos_recibidos   : std_logic_vector (39 downto 0);
+  signal check_sum         : std_logic_vector (7 downto 0);
+  signal error_checksum    : std_logic;
+  signal error_timming     : std_logic;
+
+  signal estado_flanco_asc : std_logic_vector (2 downto 0);
+  signal estado_flanco_desc: std_logic_vector (2 downto 0);
+  signal flanco_asc        : std_logic;
+  signal flanco_desc       : std_logic;
+
+  signal estado_pulso      : std_logic_vector (1 downto 0);
+  signal pulso_sal         : std_logic;
+  signal cont_pulso        : integer range 0 to 1_000_000;
+
+  -- SIGNALS DEPURACION
+  ------------------------------------------------------------------------
+  signal error_checksum_sal : std_logic;
+  signal error_timming_sal  : std_logic;
+
+  -- SIGNALS DE VISUALIZACIÓN 7SEGMENTOS
+  ------------------------------------------------------------------------
+  signal modo               : std_logic := '0';
+  signal selector_ant       : std_logic := '0';
+  signal enable_aux         : std_logic_vector (3 downto 0);
+  signal cont_base_enable   : integer range 0 to 10000000;
+  signal sal_mux            : std_logic_vector (3 downto 0);
+
+  -- SIGNALS CONVERSION BCD (DOUBLE DABBLE)
+  ------------------------------------------------------------------------
+  signal temp_ent_dht11_uni  : std_logic_vector (3 downto 0);
+  signal temp_ent_dht11_dec  : std_logic_vector (3 downto 0);
+  signal temp_deci_dht11_uni : std_logic_vector (3 downto 0);
+  signal temp_deci_dht11_dec : std_logic_vector (3 downto 0);
+  signal hum_dht11_uni       : std_logic_vector (3 downto 0);
+  signal hum_dht11_dec       : std_logic_vector (3 downto 0);
+
+  signal vector_aux_temp_ent_dht11  : std_logic_vector (15 downto 0);
+  signal vector_aux_temp_deci_dht11 : std_logic_vector (15 downto 0);
+  signal vector_aux_hum_dht11       : std_logic_vector (15 downto 0);
+
+  signal estado_conv_temp_ent_dht11  : std_logic_vector (3 downto 0);
+  signal estado_conv_temp_deci_dht11 : std_logic_vector (3 downto 0);
+  signal estado_conv_hum_dht11       : std_logic_vector (3 downto 0);
+
+  signal cont_pasos_conv_temp_ent_dht11  : integer range 0 to 8;
+  signal cont_pasos_conv_temp_deci_dht11 : integer range 0 to 8;
+  signal cont_pasos_conv_hum_dht11       : integer range 0 to 8;
+
+  signal hum_ent_dht11       : std_logic_vector(7 downto 0);
+  signal temp_ent_dht11      : std_logic_vector(7 downto 0);
+  signal temp_deci_dht11     : std_logic_vector(7 downto 0);
+  signal inicio_filtrado       : std_logic;
+  signal selector_filtrado     : std_logic;
+  signal selector_filtrado_ant : std_logic;
+
+  -- SIGNALS LEDS DE DEPURACION
+  --------------------------------------------------------------------------------
+
+  -- CONSTANTES (FILTRADO Y CARACTERES 7SEG)
+  --------------------------------------------------------------------------------
+  constant tiempo_filtro : integer := 1000;
+  constant caracter_S    : std_logic_vector(3 downto 0) := "0101";
+  constant caracter_r    : std_logic_vector(3 downto 0) := "1010";
+  constant caracter_H    : std_logic_vector(3 downto 0) := "1011";
+  constant caracter_T    : std_logic_vector(3 downto 0) := "1100";
+  constant caracter_dash : std_logic_vector(3 downto 0) := "1101";
+  constant caracter_off  : std_logic_vector(3 downto 0) := "1110";
+  constant caracter_d    : std_logic_vector(3 downto 0) := "1111";
+
+  -- DECLARACION FUNCION FILTRO_DIGITAL
+  ---------------------------------------------------------------------------------
+  component filtro_digital is
+    port(
+      clk             : in std_logic;
+      inicio          : in std_logic;
+      entrada         : in std_logic;
+      salida_filtrada : out std_logic;
+      tope_filtro     : in integer range 0 to 1000000000
+    );
+  end component;
+
+begin
+
+  filtro_digital_inicio : filtro_digital
+    port map(
+      clk             => clk,
+      inicio          => inicio,
+      entrada         => inicio,
+      salida_filtrada => inicio_filtrado,
+      tope_filtro     => tiempo_filtro
+    );
+
+  -- PROCESS PRINCIPAL COMUNICACION DHT11
+  -------------------------------------------------------------------------------
+
+  process(clk, inicio) -- MANEJO DE FLANCOS ASCENDENTES (1)
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_flanco_asc <= "000";
+      else
+        case estado_flanco_asc is
+          when "000" =>
+            if data_bus_dht11 = '1' then
+              estado_flanco_asc <= "001";
+            end if;
+          when "001" =>
+            if data_bus_dht11 = '1' then
+              estado_flanco_asc <= "010";
+            end if;
+          when "010" =>
+            if data_bus_dht11 = '1' then
+              estado_flanco_asc <= "011";
+            end if;
+          when "011" =>
+            if data_bus_dht11 = '1' then
+              estado_flanco_asc <= "100";
+            end if;
+          when "100" =>
+            if data_bus_dht11 = '0' then
+              estado_flanco_asc<="000";
+            end if;
+          when others =>
+            estado_flanco_asc<="000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+  process (estado_flanco_asc) -- MANEJO DE FLANCOS ASCENDENTES (2)
+  begin
+    case estado_flanco_asc is
+      when "000" => flanco_asc <= '0';
+      when "001" => flanco_asc <= '0';
+      when "010" => flanco_asc <= '0';
+      when "011" => flanco_asc <= '1';
+      when "100" => flanco_asc <= '0';
+      when others => flanco_asc <= '0';
+    end case;
+  end process;
+
+  process(clk, inicio) -- MANEJO DE FLANCOS DESCENDENTES (1)
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_flanco_desc <= "000";
+      else
+        case estado_flanco_desc is
+          when "000" =>
+            if data_bus_dht11 = '0' then
+              estado_flanco_desc <= "001";
+            end if;
+          when "001" =>
+            if data_bus_dht11 = '0' then
+              estado_flanco_desc <= "010";
+            end if;
+          when "010" =>
+            if data_bus_dht11 = '0' then
+              estado_flanco_desc <= "011";
+            end if;
+          when "011" =>
+            if data_bus_dht11 = '0' then
+              estado_flanco_desc <= "100";
+            end if;
+          when "100" =>
+            if data_bus_dht11 = '1' then
+              estado_flanco_desc <= "000";
+            end if;
+          when others =>
+            estado_flanco_desc <= "000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+  process (estado_flanco_desc) -- MANEJO DE FLANCOS DESCENDENTES (2)
+  begin
+    case estado_flanco_desc is
+      when "000" => flanco_desc <= '0';
+      when "001" => flanco_desc <= '0';
+      when "010" => flanco_desc <= '0';
+      when "011" => flanco_desc <= '1';
+      when "100" => flanco_desc <= '0';
+      when others => flanco_desc <= '0';
+    end case;
+  end process;
+
+  -- PROCESS DE COMUNICACIÓN DEL SENSOR DHT11
+  --------------------------------------------------------------------------
+  process(clk, inicio)
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        h <= 0;
+        cont_bits_dht11 <= 0;
+        datos_recibidos <= (others => '0');
+        data_bus_dht11 <= 'Z';
+        hum_ent_dht11 <= (others => '0');
+        temp_ent_dht11 <= (others=>'0');
+        temp_deci_dht11 <= (others => '0');
+        error_checksum <= '0';
+        error_timming <= '0';
+      else
+        case estado_dht11 is
+          when REPOSO =>
+            if h = 100_000_000 then
+              h <= 0;
+              data_bus_dht11 <= '0';
+              cont_bits_dht11 <= 0;
+              datos_recibidos <= (others => '0');
+              error_checksum <= '0';
+              error_timming <= '0';
+              estado_dht11 <= INICIO_1_8_MS;
+            else
+              h <= h + 1;
+            end if;
+          when INICIO_1_8_MS =>
+            if h = 1_800_000 then
+              h <= 0;
+              data_bus_dht11 <= 'Z';
+              estado_dht11 <= PRESENCIA_DHT;
+            else
+              h <= h + 1;
+            end if;
+          when PRESENCIA_DHT =>
+            if flanco_desc = '1' then
+              h <= 0;
+              estado_dht11 <= IN_COM_BAJO_80US;
+            else
+              if h > 4_500 then
+                estado_dht11 <= ESTADO_ERROR_TIMMING;
+              else
+                h <= h + 1;
+              end if;
+            end if;
+          when IN_COM_BAJO_80US =>
+            if flanco_asc = '1' then
+              h <= 0;
+              estado_dht11 <= IN_COM_ALTO_80US;
+            else
+              if h > 8_800 then
+                estado_dht11 <= ESTADO_ERROR_TIMMING;
+              else
+                h <= h + 1;
+              end if;
+            end if;
+          when IN_COM_ALTO_80US =>
+            if flanco_desc = '1' then
+              h <= 0;
+              estado_dht11 <= PULS_BAJO_VAR_50US;
+            else
+              if h > 8_800 then
+                estado_dht11 <= ESTADO_ERROR_TIMMING;
+              else
+                h <= h + 1;
+              end if;
+            end if;
+          when PULS_BAJO_VAR_50US =>
+            if flanco_asc = '1' then
+              h <= 0;
+              estado_dht11 <= PULS_ALTO_VAR;
+            else
+              if h > 5_500 then
+                estado_dht11 <= ESTADO_ERROR_TIMMING;
+              else
+                h <= h+1;
+              end if;
+            end if;
+          when PULS_ALTO_VAR =>
+            if flanco_desc = '1' then
+              if h < 3_000 then
+                estado_dht11 <= ALMAC_BAJO_DHT11;
+              else
+                estado_dht11 <= ALMAC_ALTO_DHT11;
+              end if;
+            else
+              if h > 7_700 then
+                estado_dht11 <= ESTADO_ERROR_TIMMING;
+              else
+                h <= h + 1;
+              end if;
+            end if;
+          when ALMAC_ALTO_DHT11 =>
+            cont_bits_dht11 <= cont_bits_dht11 + 1;
+            datos_recibidos <= datos_recibidos(38 downto 0) & '1';
+            estado_dht11 <= CONTROL_CONT_BITS;
+          when ALMAC_BAJO_DHT11 =>
+            cont_bits_dht11 <= cont_bits_dht11 + 1;
+            datos_recibidos <= datos_recibidos(38 downto 0) & '0';
+            estado_dht11 <= CONTROL_CONT_BITS;
+          when CONTROL_CONT_BITS =>
+            if cont_bits_dht11 = 40 then
+              estado_dht11 <= GENERAR_CHECKSUM;
+            else
+              h <= 0;
+              estado_dht11 <= PULS_BAJO_VAR_50US;
+            end if;
+          when GENERAR_CHECKSUM =>
+            check_sum <= datos_recibidos(39 downto 32) + datos_recibidos(31 downto 24) +
+                         datos_recibidos(23 downto 16) + datos_recibidos(15 downto 8);
+            estado_dht11 <= CONTROL_CHECKSUM;
+          when CONTROL_CHECKSUM =>
+            if check_sum /= datos_recibidos(7 downto 0) then
+              estado_dht11 <= ESTADO_ERROR_CHECKSUM;
+            else
+              estado_dht11 <= FINAL_LECTURA;
+            end if;
+          when FINAL_LECTURA =>
+            if h = 5_000 then
+              hum_ent_dht11 <= datos_recibidos(39 downto 32);
+              temp_ent_dht11 <= datos_recibidos(23 downto 16);
+              temp_deci_dht11 <= datos_recibidos(15 downto 8);
+              error_checksum_sal <= '0';
+              error_timming_sal <= '0';
+              h <= 0;
+              data_bus_dht11 <= 'Z';
+              estado_dht11 <= REPOSO;
+            else
+              h <= h + 1;
+            end if;
+          when ESTADO_ERROR_CHECKSUM =>
+            error_checksum <= '1';
+            estado_dht11<=FINAL_LECTURA;
+          when ESTADO_ERROR_TIMMING =>
+            error_timming <= '1';
+            estado_dht11 <= FINAL_LECTURA;
+          when others =>
+            estado_dht11 <= REPOSO;
+            h <= 0;
+            cont_bits_dht11 <= 0;
+            datos_recibidos <= (others => '0');
+            data_bus_dht11 <= 'Z';
+            hum_ent_dht11 <= (others => '0');
+            temp_ent_dht11 <= (others=>'0');
+            temp_deci_dht11 <= (others => '0');
+            error_checksum <= '0';
+            error_timming <= '0';
+        end case;
+      end if;
+    end if;
+  end process;
+
+  -- PROCESS DE CONVERSION BCD (DOUBLE DABBLE)
+  -----------------------------------------------------------------------------------
+  process (clk) -- PROCESS CONVERSION HUMEDAD ENTEROS
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_conv_hum_dht11 <= "0000";
+        vector_aux_hum_dht11 <= (others => '0');
+        cont_pasos_conv_hum_dht11 <= 0;
+        hum_dht11_dec <= "0000";
+        hum_dht11_uni <= "0000";
+      else
+        case estado_conv_hum_dht11 is
+          when "0000" =>
+            vector_aux_hum_dht11 <= "00000000" & hum_ent_dht11;
+            cont_pasos_conv_hum_dht11 <= 0;
+            estado_conv_hum_dht11 <= "0001";
+          when "0001" =>
+            if unsigned(vector_aux_hum_dht11(15 downto 12)) > 4 then
+              vector_aux_hum_dht11(15 downto 12) <= std_logic_vector(
+                unsigned(vector_aux_hum_dht11(15 downto 12)) + 3);
+            end if;
+            if unsigned(vector_aux_hum_dht11(11 downto 8)) > 4 then
+              vector_aux_hum_dht11(11 downto 8) <= std_logic_vector(
+                unsigned(vector_aux_hum_dht11(11 downto 8)) + 3);
+            end if;
+            estado_conv_hum_dht11 <= "0010";
+          when "0010" => -- Desplazamiento a la izquierda
+            vector_aux_hum_dht11 <= vector_aux_hum_dht11(14 downto 0) & '0';
+            if cont_pasos_conv_hum_dht11 = 7 then
+              estado_conv_hum_dht11 <= "1000";
+            else
+              cont_pasos_conv_hum_dht11 <= cont_pasos_conv_hum_dht11 + 1;
+              estado_conv_hum_dht11 <= "0001";
+            end if;
+          when "1000" => -- Extracción de valores BCD
+            hum_dht11_dec <= vector_aux_hum_dht11(15 downto 12);
+            hum_dht11_uni <= vector_aux_hum_dht11(11 downto 8);
+            estado_conv_hum_dht11 <= "0000";
+          when others =>
+            estado_conv_hum_dht11 <= "0000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+  process (clk) -- PROCESS CONVERSION TEMPERATURA ENTEROS
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_conv_temp_ent_dht11 <= "0000";
+        vector_aux_temp_ent_dht11 <= (others => '0');
+        cont_pasos_conv_temp_ent_dht11 <= 0;
+        temp_ent_dht11_dec <= "0000";
+        temp_ent_dht11_uni <= "0000";
+      else
+        case estado_conv_temp_ent_dht11 is
+          when "0000" =>
+            vector_aux_temp_ent_dht11 <= "00000000" & temp_ent_dht11;
+            cont_pasos_conv_temp_ent_dht11 <= 0;
+            estado_conv_temp_ent_dht11 <= "0001";
+          when "0001" =>
+            if unsigned(vector_aux_temp_ent_dht11(15 downto 12)) > 4 then
+              vector_aux_temp_ent_dht11(15 downto 12) <=
+                std_logic_vector(unsigned(vector_aux_temp_ent_dht11(15 downto 12)) + 3);
+            end if;
+            if unsigned(vector_aux_temp_ent_dht11(11 downto 8)) > 4 then
+              vector_aux_temp_ent_dht11(11 downto 8) <= std_logic_vector
+                (unsigned(vector_aux_temp_ent_dht11(11 downto 8)) + 3);
+            end if;
+            estado_conv_temp_ent_dht11 <= "0010";
+          when "0010" =>
+            vector_aux_temp_ent_dht11 <= vector_aux_temp_ent_dht11(14 downto 0) & '0';
+            if cont_pasos_conv_temp_ent_dht11 = 7 then
+              estado_conv_temp_ent_dht11 <= "1000";
+            else
+              cont_pasos_conv_temp_ent_dht11 <= cont_pasos_conv_temp_ent_dht11 + 1;
+              estado_conv_temp_ent_dht11 <= "0001";
+            end if;
+          when "1000" =>
+            temp_ent_dht11_dec <= vector_aux_temp_ent_dht11(15 downto 12);
+            temp_ent_dht11_uni <= vector_aux_temp_ent_dht11(11 downto 8);
+            estado_conv_temp_ent_dht11 <= "0000";
+          when others =>
+            estado_conv_temp_ent_dht11 <= "0000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+  process (clk) -- PROCESS CONVERSION TEMPERATURA DECIMALES
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_conv_temp_deci_dht11 <= "0000";
+        vector_aux_temp_deci_dht11 <= (others => '0');
+        cont_pasos_conv_temp_deci_dht11 <= 0;
+        temp_deci_dht11_dec <= "0000";
+        temp_deci_dht11_uni <= "0000";
+      else
+        case estado_conv_temp_deci_dht11 is
+          when "0000" => -- Inicialización
+            vector_aux_temp_deci_dht11 <= "00000000" & temp_deci_dht11;
+            cont_pasos_conv_temp_deci_dht11 <= 0;
+            estado_conv_temp_deci_dht11 <= "0001";
+          when "0001" => -- Suma 3 BCD (si >4, suma 3)
+            if unsigned(vector_aux_temp_deci_dht11(15 downto 12)) > 4 then
+              vector_aux_temp_deci_dht11(15 downto 12) <=
+                std_logic_vector(unsigned(vector_aux_temp_deci_dht11(15 downto 12)) + 3);
+            end if;
+            if unsigned(vector_aux_temp_deci_dht11(11 downto 8)) > 4 then
+              vector_aux_temp_deci_dht11(11 downto 8) <=
+                std_logic_vector(unsigned(vector_aux_temp_deci_dht11(11 downto 8)) + 3);
+            end if;
+            estado_conv_temp_deci_dht11 <= "0010";
+          when "0010" => -- Desplazamiento a la izquierda
+            vector_aux_temp_deci_dht11 <= vector_aux_temp_deci_dht11(14 downto 0) & '0';
+            if cont_pasos_conv_temp_deci_dht11 = 7 then
+              estado_conv_temp_deci_dht11 <= "1000";
+            else
+              cont_pasos_conv_temp_deci_dht11 <= cont_pasos_conv_temp_deci_dht11 + 1;
+              estado_conv_temp_deci_dht11 <= "0001";
+            end if;
+          when "1000" => -- Extracción de valores BCD
+            temp_deci_dht11_dec <= vector_aux_temp_deci_dht11(15 downto 12);
+            temp_deci_dht11_uni <= vector_aux_temp_deci_dht11(11 downto 8);
+            estado_conv_temp_deci_dht11 <= "0000";
+          when others =>
+            estado_conv_temp_deci_dht11 <= "0000";
+        end case;
+      end if;
+    end if;
+  end process;
+
+  -- PROCESS DE CONFIGURACION DE 7SEGMENTOS (cont_base_enable, sal_mux, segmentos, etc...)
+  -------------------------------------------------------------------------------------------------
+  process(inicio, clk) -- Configuración del cont_base_enable
+  begin
+    if inicio = '1' then
+      cont_base_enable <= 0;
+    elsif rising_edge(clk) then
+      if cont_base_enable = 100000 then
+        cont_base_enable <= 0;
+      else
+        cont_base_enable<=cont_base_enable+1;
+      end if;
+    end if;
+  end process;
+
+  process(clk,inicio) -- PROCESS CONTADOR BASE ENABLE
+  begin
+    if inicio = '1' then
+      enable_aux <= "1101";
+    elsif rising_edge(clk) then
+      if cont_base_enable = 100000 then
+        enable_aux <= enable_aux(2 downto 0) & enable_aux(3);
+      end if;
+    end if;
+  end process;
+  --fin de la activación de los siete seg
+
+  enable_seg <= enable_aux;
+
+  -- PROCESS MULTIPLEXADO DE ENTRADAS 7-SEGMENTOS
+  -----------------------------------------------------------------------------------
+  process(enable_aux, temp_ent_dht11_dec, temp_ent_dht11_uni, temp_deci_dht11_dec,
+          temp_deci_dht11_uni, hum_dht11_dec, hum_dht11_uni, selector)
+  begin
+    case selector is
+      when '0' => -- DHT11 Temperatura: TT.tt
+        case enable_aux is
+          when "0111" => sal_mux <= temp_ent_dht11_dec;
+          when "1011" => sal_mux <= temp_ent_dht11_uni;
+          when "1101" => sal_mux <= temp_deci_dht11_dec;
+          when "1110" => sal_mux <= temp_deci_dht11_uni;
+          when others => sal_mux <= caracter_off;
+        end case;
+      when '1' => -- DHT11 Humedad: --HH
+        case enable_aux is
+          when "0111" => sal_mux <= caracter_dash;
+          when "1011" => sal_mux <= caracter_dash;
+          when "1101" => sal_mux <= hum_dht11_dec;
+          when "1110" => sal_mux <= hum_dht11_uni;
+          when others => sal_mux <= caracter_off;
+        end case;
+      when others =>
+        sal_mux <= "1111";
+    end case;
+  end process;
+
+  -- PROCESS DECODIFICADOR 7-SEGMENTOS
+  --------------------------------------------------------------------------
+  process(sal_mux)
+  begin
+    case sal_mux is
+      when "0000" => segmentos <= "0000001";
+      when "0001" => segmentos <= "1001111";
+      when "0010" => segmentos <= "0010010";
+      when "0011" => segmentos <= "0000110";
+      when "0100" => segmentos <= "1001100";
+      when "0101" => segmentos <= "0100100";
+      when "0110" => segmentos <= "1100000";
+      when "0111" => segmentos <= "0001111";
+      when "1000" => segmentos <= "0000000";
+      when "1001" => segmentos <= "0001100";
+      when caracter_r => segmentos <= "1111010";
+      when caracter_T => segmentos <= "0111001";
+      when caracter_dash => segmentos <= "1111110";
+      when caracter_off => segmentos <= "1111111";
+      when caracter_H => segmentos <= "1001000";
+      when caracter_d => segmentos <= "1000010";
+      when others => segmentos <= "1111111";
+    end case;
+  end process;
+end Behavioral;
