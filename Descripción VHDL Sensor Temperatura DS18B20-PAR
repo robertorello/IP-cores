@@ -1,0 +1,431 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.std_logic_unsigned.all;
+
+entity DS18B20_MARK_29 is
+  port (
+    clk              : in std_logic;
+    inicio           : in std_logic;
+    segmentos        : out std_logic_vector (6 downto 0);
+    enable_seg       : out std_logic_vector (3 downto 0);
+    data_bus_ds18b20 : inout std_logic;
+    crc_en           : out std_logic
+  );
+end entity DS18B20_MARK_29;
+
+architecture Behavioral of DS18B20_MARK_29 is
+
+  type ESTADOS_DS18B20 is (
+    ESPERA_800ms,
+    RESET,
+    PRESENCIA,
+    ENVIAR_ROM,
+    ESCRIBIR_BYTE,
+    ESCRIBIR_BAJO,
+    ESCRIBIR_ALTO,
+    OBTENER_DATA,
+    LEER_BIT
+  );
+
+  type ESTADOS_CALC_DEC is (
+    CALCULAR_INT,
+    CALCULAR_ESC,
+    CALCULAR_BCD
+  );
+
+  type estados_ENVIAR is (
+    SKIP_ROM_1,
+    CONVERT_T,
+    WAIT_ROM,
+    SKIP_ROM_2,
+    READ_SCRATCHPAD,
+    COGER_DATA
+  );
+
+  signal estado_calc_dec   : ESTADOS_CALC_DEC := CALCULAR_INT;
+  signal temp_deci_int     : integer range 0 to 15;
+  signal temp_deci_esc     : integer range 0 to 99;
+  signal enable_aux        : std_logic_vector (3 downto 0);
+  signal cont_base_enable  : integer range 0 to 100000;
+  signal sal_mux           : std_logic_vector (3 downto 0);
+  signal temperatura       : std_logic_vector (15 downto 0);
+  signal estado_conv_temp  : std_logic_vector (3 downto 0);
+  signal vector_aux_temp   : std_logic_vector (31 downto 0);
+  signal cont_pasos_temp   : integer range 0 to 15;
+  signal dec_temp          : std_logic_vector (3 downto 0);
+  signal uni_temp          : std_logic_vector (3 downto 0);
+
+  signal cnt_bit           : integer range 0 to 71; --gh
+  signal estado_ds18b20    : ESTADOS_DS18B20 := RESET;
+  signal data              : std_logic_vector (71 downto 0); -- Datos leídos del sensor (9 bytes)
+  signal s_reset           : std_logic;
+  signal i                 : integer range 0 to 799999;
+  signal comando_escritura : std_logic_vector (7 downto 0);
+  signal senal_presencia   : std_logic;
+  signal cont_escr_byte    : integer range 0 to 8 := 0;
+
+  signal estado_ENVIAR     : estados_ENVIAR := SKIP_ROM_1;
+  signal estado_escr_bajo  : integer range 0 to 2 := 0;
+  signal estado_escr_alto  : integer range 0 to 2 := 0;
+  signal estado_leer_bit   : integer range 0 to 3 := 0;
+  signal cont_obtener_data : integer range 0 to 72 := 0;
+  signal cont_aux          : integer range 0 to 100;
+  signal dataOut           : std_logic_vector (71 downto 0); -- Copia estable de 'data' para el resto del sistema
+  signal temperatura_vec   : std_logic_vector (7 downto 0);
+
+  signal bcd_decimas       : std_logic_vector (3 downto 0) := "0000";
+  signal bcd_centesimas    : std_logic_vector (3 downto 0) := "0000";
+
+  constant ERROR_PRESENCIA : std_logic_vector (71 downto 0) := (others => '1');
+
+begin
+
+  -- PROCESS PRINCIPAL COMUNICACIÓN DS18B20
+  -------------------------------------------------------------------------
+
+  process(clk, cont_aux)
+  begin
+    if rising_edge(clk) and cont_aux=0 then
+      case estado_ds18b20 is
+        when RESET =>
+          S_reset <= '0';
+          if (i = 0) then
+            data_bus_ds18b20 <= '0';
+          elsif (i = 485) then
+            data_bus_ds18b20 <= 'Z';
+          elsif (i = 550) then
+            senal_presencia <= data_bus_ds18b20;
+          elsif (i = 1000) then
+            estado_ds18b20 <= PRESENCIA;
+          end if;
+
+        when PRESENCIA =>
+          if (senal_presencia = '0' and data_bus_ds18b20 = '1') then
+            S_reset <= '1';
+            estado_ds18b20 <= ENVIAR_ROM;
+          else
+            S_reset <= '1';
+            dataOut <= ERROR_PRESENCIA;
+            crc_en <= '1';
+            estado_ds18b20 <= ESPERA_800MS;
+          end if;
+
+        when ENVIAR_ROM =>
+          if (estado_ENVIAR = SKIP_ROM_1) then
+            estado_ENVIAR <= CONVERT_T;
+            comando_escritura <="11001100";
+            estado_ds18b20 <= ESCRIBIR_BYTE;
+          elsif (estado_ENVIAR = CONVERT_T) then
+            estado_ENVIAR <= WAIT_ROM;
+            comando_escritura <="01000100";
+            estado_ds18b20 <= ESCRIBIR_BYTE;
+          elsif (estado_ENVIAR = WAIT_ROM) then
+            estado_ENVIAR <= SKIP_ROM_2;
+            estado_ds18b20 <= ESPERA_800MS;
+          elsif (estado_ENVIAR = SKIP_ROM_2) then
+            estado_ENVIAR <= READ_SCRATCHPAD;
+            comando_escritura <="11001100";
+            estado_ds18b20 <= ESCRIBIR_BYTE;
+          elsif (estado_ENVIAR = READ_SCRATCHPAD) then
+            estado_ENVIAR <= COGER_DATA;
+            comando_escritura <="10111110";
+            estado_ds18b20 <= ESCRIBIR_BYTE;
+          elsif (estado_ENVIAR = COGER_DATA) then
+            estado_ENVIAR <= SKIP_ROM_1;
+            estado_ds18b20 <= OBTENER_DATA;
+          end if;
+
+        when ESPERA_800MS =>
+          crc_en <= '0';
+          S_reset <= '0';
+          if (i = 799) then
+            S_reset <='1';
+            estado_ds18b20 <= RESET;
+          end if;
+
+        when OBTENER_DATA =>
+          case cont_obtener_data is
+            when 0 to 71=>
+              data_bus_ds18b20 <= '0';
+              cont_obtener_data <= cont_obtener_data + 1;
+              estado_ds18b20 <= LEER_BIT;
+            when 72=>
+              cnt_bit <= 0;
+              cont_obtener_data <=0;
+              dataOut <= data(71 downto 0);
+              crc_en <= '1';
+              estado_ds18b20 <= ESPERA_800MS;
+            when others =>
+              estado_leer_bit <= 0;
+              cont_obtener_data <= 0;
+          end case;
+
+        when LEER_BIT =>
+          case estado_leer_bit is
+            when 0=>
+              estado_leer_bit <= 1;
+            when 1=>
+              data_bus_ds18b20 <= 'Z';
+              S_reset <= '0';
+              if (i = 13) then
+                s_reset <= '1';
+                estado_leer_bit <= 2;
+              end if;
+            when 2=>
+              data(cnt_bit) <= data_bus_ds18b20;
+              cnt_bit <= cnt_bit + 1;
+              estado_leer_bit <= 3;
+            when 3=>
+              S_reset <= '0';
+              if (i = 63) then
+                S_reset<='1';
+                estado_leer_bit <= 0;
+                estado_ds18b20 <= OBTENER_DATA;
+              end if;
+            when others =>
+              estado_leer_bit <= 0;
+              cnt_bit <= 0;
+              cont_obtener_data <= 0;
+              estado_ds18b20 <= RESET;
+          end case;
+
+        when ESCRIBIR_BYTE =>
+          case cont_escr_byte is
+            when 0 to 7=>
+              if (comando_escritura(cont_escr_byte) = '0') then
+                estado_ds18b20 <= ESCRIBIR_BAJO;
+              else
+                estado_ds18b20 <= ESCRIBIR_ALTO;
+              end if;
+              cont_escr_byte <= cont_escr_byte + 1;
+            when 8=>
+              cont_escr_byte <= 0;
+              estado_ds18b20 <= ENVIAR_ROM;
+            when others=>
+              cont_escr_byte <= 0;
+              estado_escr_bajo <= 0;
+              estado_escr_alto <= 0;
+              estado_ds18b20 <= RESET;
+          end case;
+
+        when ESCRIBIR_BAJO =>
+          case estado_escr_bajo is
+            when 0=>
+              data_bus_ds18b20 <= '0';
+              S_reset <= '0';
+              if (i = 59) then
+                S_reset <='1';
+                estado_escr_bajo <= 1;
+              end if;
+            when 1=>
+              data_bus_ds18b20 <= 'Z';
+              S_reset <= '0';
+              if (i = 3) then
+                S_reset <= '1';
+                estado_escr_bajo <= 2;
+              end if;
+            when 2=>
+              estado_escr_bajo <= 0;
+              estado_ds18b20 <= ESCRIBIR_BYTE;
+            when others=>
+              cont_escr_byte <= 0;
+              estado_escr_bajo <= 0;
+              estado_ds18b20 <= RESET;
+          end case;
+
+        when ESCRIBIR_ALTO =>
+          case estado_escr_alto is
+            when 0=>
+              data_bus_ds18b20 <= '0';
+              S_reset <= '0';
+              if (i = 9) then
+                S_reset <= '1';
+                estado_escr_alto <= 1;
+              end if;
+            when 1=>
+              data_bus_ds18b20 <= 'Z';
+              S_reset <= '0';
+              if (i = 53) then
+                S_reset <= '1';
+                estado_escr_alto <= 2;
+              end if;
+            when 2=>
+              estado_escr_alto <= 0;
+              estado_ds18b20 <= ESCRIBIR_BYTE;
+            when others =>
+              cont_escr_byte <= 0;
+              estado_escr_alto <= 0;
+              estado_ds18b20 <= RESET;
+          end case;
+
+        when others =>
+          estado_ds18b20 <= RESET;
+
+      end case;
+    end if;
+  end process;
+
+  process(clk, S_reset)
+  begin
+    if (rising_edge(clk)) then
+      if cont_aux=100 then
+        cont_aux<=0;
+        if (S_reset = '1')then
+          i <= 0;
+        else
+          i <= i + 1;
+        end if;
+      else
+        cont_aux<=cont_aux+1;
+      end if;
+    end if;
+  end process;
+
+  -- PROCESS ASIGNACION TEMP
+  -------------------------------------------------------------------------
+  -- Combina bits 11-8 y 7-4 de 'dataOut' (lectura estable) para parte entera.
+  process(inicio, clk)
+  begin
+    if inicio = '1' then
+      temperatura_vec <= (others => '0');
+    elsif (rising_edge(clk)) then
+      temperatura_vec <= dataOut(11 downto 8) & dataOut (7 downto 4);
+    end if;
+  end process;
+
+  temperatura <= "00000000" & temperatura_vec;
+
+  -- PROCESS CONVERSION BCD PARTE ENTERA
+  ------------------------------------------------------------------------
+  process (inicio, clk)
+  begin
+    if inicio = '1' then
+      estado_conv_temp <= "0000";
+      vector_aux_temp <= "0000000000000000" & temperatura;
+      cont_pasos_temp <= 0;
+      dec_temp <= "0000";
+      uni_temp <= "0000";
+    elsif rising_edge(clk) then
+      case estado_conv_temp is
+        when "0000" =>
+          vector_aux_temp <= "0000000000000000" & temperatura;
+          cont_pasos_temp <= 0;
+          estado_conv_temp <= "0001";
+        when "0001" =>
+          vector_aux_temp <= vector_aux_temp (30 downto 0) & '0';
+          cont_pasos_temp <= cont_pasos_temp + 1;
+          if cont_pasos_temp < 15 then
+            estado_conv_temp <= "0010";
+          else
+            estado_conv_temp <= "1000";
+          end if;
+        when "0010" =>
+          if vector_aux_temp (31 downto 28) > "0100" then
+            vector_aux_temp (31 downto 28) <= vector_aux_temp (31 downto 28) + "0011";
+          end if;
+          if vector_aux_temp (27 downto 24) > "0100" then
+            vector_aux_temp(27 downto 24) <= vector_aux_temp (27 downto 24) + "0011";
+          end if;
+          if vector_aux_temp (23 downto 20) > "0100" then
+            vector_aux_temp (23 downto 20) <= vector_aux_temp (23 downto 20) + "0011";
+          end if;
+          if vector_aux_temp (19 downto 16) > "0100" then
+            vector_aux_temp (19 downto 16) <= vector_aux_temp (19 downto 16) + "0011";
+          end if;
+          estado_conv_temp <= "0001";
+        when "1000" =>
+          dec_temp <= vector_aux_temp (23 downto 20);
+          uni_temp <= vector_aux_temp (19 downto 16);
+          estado_conv_temp <= "0000";
+        when others =>
+          estado_conv_temp <= "0000";
+      end case;
+    end if;
+  end process;
+
+  -- PROCESS CONVERSION BCD DECIMALES
+  --------------------------------------------------------------------------
+  process(clk, inicio)
+  begin
+    if inicio = '1' then
+      temp_deci_int <= 0;
+      temp_deci_esc <= 0;
+      bcd_decimas <= (others => '0');
+      bcd_centesimas <= (others => '0');
+      estado_calc_dec <= CALCULAR_INT;
+    elsif rising_edge(clk) then
+      case estado_calc_dec is
+        when CALCULAR_INT =>
+          -- Etapa 1: Extrae los 4 bits fraccionarios y almacena en temp_deci_int
+          temp_deci_int <= to_integer(unsigned(dataOut(3 downto 0)));
+          estado_calc_dec <= CALCULAR_ESC;
+        when CALCULAR_ESC =>
+          -- Etapa 2: Usa el temp_deci_int calculado en el ciclo anterior
+          temp_deci_esc <= (temp_deci_int * 100) / 16;
+          estado_calc_dec <= CALCULAR_BCD;
+        when CALCULAR_BCD =>
+          -- Etapa 3: Usa el temp_deci_esc calculado en el ciclo anterior
+          bcd_decimas <= std_logic_vector(to_unsigned((temp_deci_esc / 10) mod 10, 4));
+          bcd_centesimas <= std_logic_vector(to_unsigned(temp_deci_esc mod 10, 4));
+          estado_calc_dec <= CALCULAR_INT;
+        when others =>
+          estado_calc_dec <= CALCULAR_INT;
+      end case;
+    end if;
+  end process;
+
+  process(inicio, clk)
+  begin
+    if inicio = '1' then
+      cont_base_enable <= 0;
+    elsif rising_edge(clk) then
+      if cont_base_enable = 100000 then
+        cont_base_enable <= 0;
+      else
+        cont_base_enable <= cont_base_enable + 1;
+      end if;
+    end if;
+  end process;
+
+  process(clk,inicio)
+  begin
+    if inicio = '1' then
+      enable_aux<="1110";
+    elsif rising_edge(clk) then
+      if cont_base_enable = 100000 then
+        enable_aux <= enable_aux(2 downto 0) & enable_aux(3);
+      end if;
+    end if;
+  end process;
+
+  enable_seg<=enable_aux;
+
+  process(enable_aux, dec_temp, uni_temp, bcd_decimas, bcd_centesimas)
+  begin
+    case enable_aux is
+      when "0111" => sal_mux <= dec_temp;
+      when "1011" => sal_mux <= uni_temp;
+      when "1101" => sal_mux <= bcd_decimas;
+      when "1110" => sal_mux <= bcd_centesimas;
+      when others => sal_mux <= "1111";
+    end case;
+  end process;
+
+  process(sal_mux)
+  begin
+    case sal_mux is
+      when "0000" => segmentos <= "0000001"; -- 0
+      when "0001" => segmentos <= "1001111"; -- 1
+      when "0010" => segmentos <= "0010010"; -- 2
+      when "0011" => segmentos <= "0000110"; -- 3
+      when "0100" => segmentos <= "1001100"; -- 4
+      when "0101" => segmentos <= "0100100"; -- 5
+      when "0110" => segmentos <= "0100000"; -- 6
+      when "0111" => segmentos <= "0001111"; -- 7
+      when "1000" => segmentos <= "0000000"; -- 8
+      when "1001" => segmentos <= "0001100"; -- 9
+      when others => segmentos <= "1111111"; -- Apagado
+    end case;
+  end process;
+end Behavioral;
