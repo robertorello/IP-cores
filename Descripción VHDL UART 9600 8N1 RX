@@ -1,0 +1,174 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.std_logic_unsigned.all;
+
+entity UART_TX_V1 is
+  port (
+    clk      : in std_logic;
+    sw       : in std_logic_vector(7 downto 0); --interruptores
+    pulsador : in STD_LOGIC;
+    inicio   : in STD_LOGIC;
+    serialTX : out std_logic
+  );
+end UART_TX_V1;
+
+architecture Behavioral of UART_TX_V1 is
+
+  type ESTADO is (
+    REPOSO,
+    START,
+    TX,
+    STOP
+  );
+
+  constant NUM_BITS  : integer := 8;
+  constant NUM_START : integer := 1;
+  constant NUM_STOP  : integer := 1;
+  constant FREQ_CLK  : integer := 100_000_000;
+  constant BPS       : integer := 9_600; --19200, 38400, 57600 y 115200
+
+  signal start_tx         : std_logic;
+  signal entrada_uart     : std_logic_vector (7 downto 0);
+  signal entrada_uart_aux : std_logic_vector (7 downto 0);
+
+  signal estado_tx        : ESTADO := REPOSO;
+  signal cont_uart_tx     : integer range 0 to 2000000;
+  signal cont_bit_tx      : integer range 0 to NUM_BITS;
+  signal entrada_tx       : std_logic;
+  signal salida_tx        : std_logic;
+  signal arranca_tx       : std_logic;
+  signal pulsos_bps       : integer range 0 to 11000;
+
+  signal estado_puls : std_logic_vector (1 downto 0);
+  signal cont_filtro : integer range 0 to 100000;
+  signal salida      : std_logic;
+
+begin
+
+  pulsos_bps <= FREQ_CLK/BPS;
+  arranca_tx <= salida;
+  entrada_uart <= sw;
+  serialTX <= salida_tx;
+
+  process(clk, inicio)
+  begin
+    if inicio = '1' then
+      estado_puls <= "00";
+    elsif rising_edge(clk) then
+      case estado_puls is
+        when "00" =>
+          cont_filtro <= 0;
+          if pulsador = '0' then
+            estado_puls <= "00";
+          else
+            estado_puls <= "01";
+          end if;
+        when "01" =>
+          cont_filtro <= cont_filtro + 1;
+          if pulsador = '1' and cont_filtro < 100000 then
+            estado_puls <= "01";
+          elsif pulsador = '1' and cont_filtro = 100000 then
+            estado_puls <= "10";
+          else
+            estado_puls <= "00";
+          end if;
+        when "10" =>
+          cont_filtro <= 0;
+          estado_puls <= "11";
+        when "11" =>
+          cont_filtro <= 0;
+          if pulsador = '1' then
+            estado_puls <= "11";
+          else
+            estado_puls <= "00";
+          end if;
+        when others =>
+          cont_filtro <= 0;
+          estado_puls <= "00";
+      end case;
+    end if;
+  end process;
+
+  process(estado_puls)
+  begin
+    case estado_puls is
+      when "00" => salida <= '0';
+      when "01" => salida <= '0';
+      when "10" => salida <= '1';
+      when "11" => salida <= '0';
+      when others => salida <= '0';
+    end case;
+  end process;
+
+  process(clk, inicio)
+  begin
+    if rising_edge(clk) then
+      if inicio = '1' then
+        estado_tx <= REPOSO;
+        cont_uart_tx <= 0;
+        cont_bit_tx <= 0;
+        entrada_uart_aux <= entrada_uart;
+        entrada_tx <= '0';
+        salida_tx<='1';
+      else
+        case estado_tx is
+          when REPOSO =>
+            if arranca_tx = '1' then
+              estado_tx <= START;
+              cont_uart_tx <= 0;
+              cont_bit_tx <= 0;
+              salida_tx <= '0';
+              entrada_tx <= entrada_uart_aux(0);
+              entrada_uart_aux <= '0' & entrada_uart_aux(7 downto 1);
+            else
+              entrada_uart_aux<=entrada_uart;
+            end if;
+          when START =>
+            if cont_uart_tx = (pulsos_bps * num_start - 1) then
+              estado_tx <= TX;
+              cont_uart_tx <= 0;
+              salida_tx <= '0';
+            else
+              cont_uart_tx <= cont_uart_tx + 1;
+              salida_tx <= '0';
+            end if;
+          when TX =>
+            if cont_uart_tx = (pulsos_bps - 1) then
+              if cont_bit_tx = NUM_BITS - 1 then
+                estado_tx <= STOP;
+                cont_uart_tx <= 0;
+                salida_tx <= entrada_tx;
+              else
+                entrada_tx <= entrada_uart_aux(0);
+                entrada_uart_aux <= '0' & entrada_uart_aux(7 downto 1);
+                cont_uart_tx <= 0;
+                cont_bit_tx <= cont_bit_tx + 1;
+                salida_tx <= entrada_tx;
+              end if;
+            else
+              cont_uart_tx <= cont_uart_tx + 1;
+              salida_tx <= entrada_tx;
+            end if;
+          when STOP =>
+            if cont_uart_tx = (pulsos_bps * num_stop - 1) then
+              estado_tx <= REPOSO;
+              cont_uart_tx <= 0;
+              cont_bit_tx <= 0;
+              salida_tx<='1';
+            else
+              cont_uart_tx<=cont_uart_tx+1;
+              salida_tx<='1';
+            end if;
+          when others =>
+            cont_uart_tx <= 0;
+            estado_tx <= REPOSO;
+            cont_bit_tx <= 0;
+            entrada_tx <= '0';
+            salida_tx <= '1';
+        end case;
+      end if;
+    end if;
+  end process;
+
+end Behavioral;
