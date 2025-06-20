@@ -1,0 +1,68 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use IEEE.std_logic_unsigned.all;
+
+entity filtro_digital is
+  port(
+    clk: in std_logic;
+    inicio: in std_logic; -- Reset para el filtro
+    entrada: in std_logic; -- Señal del botón SIN filtrar
+    salida_filtrada: out std_logic; -- Señal del botón CON filtrar
+    tope_filtro: in integer range 0 to 100000000 -- Límite contador
+end filtro_digital;
+
+architecture Behavioral of filtro_digital is
+  type estado_nombre_filtro is (CERO, FILTRO_1, UNO, FILTRO_0);
+  signal estado_filtro: estado_nombre_filtro;
+  signal pulso_filtrado: std_logic; -- Señal interna antes de la salida
+  signal cont_filtro: integer range 0 to 100000000;
+begin
+  salida_filtrada <= pulso_filtrado;
+  process(clk, inicio)
+  begin
+    if inicio='1' then
+      estado_filtro <= CERO;
+      cont_filtro <= 0;
+    elsif rising_edge(clk) then
+      case estado_filtro is
+        when CERO =>
+          cont_filtro <= 0;
+          if entrada = '0' then estado_filtro <= CERO;
+          else estado_filtro <= FILTRO_1; end if;
+        when FILTRO_1 =>
+          cont_filtro <= cont_filtro + 1;
+          if entrada = '1' and cont_filtro < tope_filtro - 1 then
+            estado_filtro <= FILTRO_1;
+          elsif entrada = '1' and cont_filtro = tope_filtro - 1 then
+            estado_filtro <= UNO;
+          else estado_filtro <= CERO; end if; -- entrada='0'
+        when UNO =>
+          cont_filtro <= 0;
+          if entrada = '1' then estado_filtro <= UNO;
+          else estado_filtro <= FILTRO_0; end if;
+        when FILTRO_0 =>
+          cont_filtro <= cont_filtro + 1;
+          if entrada = '0' and cont_filtro < tope_filtro - 1 then
+            estado_filtro <= FILTRO_0;
+          elsif entrada = '0' and cont_filtro = tope_filtro - 1 then
+            estado_filtro <= CERO;
+          else estado_filtro <= UNO; end if; -- entrada='1'
+        when others => cont_filtro <= 0; estado_filtro <= CERO;
+      end case;
+    end if;
+  end process;
+
+  process(estado_filtro)
+  begin
+    case estado_filtro is
+      when CERO => pulso_filtrado <= '0';
+      when FILTRO_1 => pulso_filtrado <= '0';
+      when UNO => pulso_filtrado <= '1';
+      when FILTRO_0 => pulso_filtrado <= '1';
+      when others => pulso_filtrado <= '0';
+    end case;
+  end process;
+
+end Behavioral;
